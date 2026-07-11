@@ -11,6 +11,8 @@
 #   make provision   - overlay on the base: kernel, dev tools, Claude Code
 #   make reprovision - wipe ONLY the provision layer and redo it (base is
 #                      cached; no new debootstrap, no Debian re-download)
+#   make install PKGS="a b" - apt-install packages into the system image
+#                      (writes into the provision layer, repacks the image)
 #   make image       - pack the rootfs into a read-only erofs image
 #   make workspace   - create the writable workspace disk (only if missing)
 #   make qemu        - boot in QEMU (serial console, user networking)
@@ -236,7 +238,7 @@ export SERIAL_PROFILE
 # ---- stamps -----------------------------------------------------------------
 PROVISION_STAMP := $(LAYERS)/.provision-done
 
-.PHONY: help all check-deps base rootfs provision clean-provision reprovision image workspace qemu ssh import repos clone clean clean-workspace distclean
+.PHONY: help all check-deps base rootfs provision clean-provision reprovision install install-pkgs image workspace qemu ssh import repos clone clean clean-workspace distclean
 
 # muscle-memory alias for the renamed stage
 rootfs: base
@@ -249,6 +251,7 @@ Claustrum -- immutable Debian VM for Claude Code
   make import REPO=url  put a repo in the guest git server
   make repos            list guest repos   make clone NAME=n  clone to host
   make reprovision      redo provisioning on the cached Debian base
+  make install PKGS="a b"  add packages to the system image
   make check-deps       verify host tools
 
   Rebuild cost:  edit provisioning -> reprovision (minutes)
@@ -538,10 +541,13 @@ import: | check-deps
 		echo "usage: make import REPO=<git-url> [NAME=<repo-name>]"; exit 1
 	fi
 	name="$(NAME)"; [ -n "$$name" ] || name="$$(basename "$(REPO)" .git)"
+	echo "Importing $(REPO) -> guest:$(GUEST_GIT)/$$name.git"
+	# --progress forces git's transfer meter even though stderr is a pipe
+	# (over ssh it isn't a tty, so git would otherwise stay silent)
 	$(GUEST_SSH) "set -e; \
-		git clone --bare '$(REPO)' '$(GUEST_GIT)/$$name.git'; \
+		git clone --bare --progress '$(REPO)' '$(GUEST_GIT)/$$name.git'; \
 		git -C '$(GUEST_GIT)/$$name.git' config receive.denyDeletes false; \
-		git clone '$(GUEST_GIT)/$$name.git' '$(GUEST_SRC)/$$name'"
+		git clone --progress '$(GUEST_GIT)/$$name.git' '$(GUEST_SRC)/$$name'"
 	echo ""
 	echo "Imported. Inside the guest, Claude Code works in: $(GUEST_SRC)/$$name"
 	echo "From the host:"
@@ -571,6 +577,45 @@ clean-provision:
 # Redo provisioning from the pristine cached base: no debootstrap,
 # no Debian re-download -- typically the apt mirror fetch is all that's left
 reprovision: clean-provision
+	$(MAKE) image
+
+# Install extra packages into the system image without a full reprovision:
+# chroot into the overlay, apt-get install, repack. The packages land in the
+# provision layer, so they persist across image rebuilds -- but NOT across
+# `make reprovision`; add them to DEV_PKGS for that.
+#   make install PKGS="htop strace"
+install-pkgs:
+	set -euo pipefail
+	if [ -z "$(PKGS)" ]; then
+		echo 'usage: make install PKGS="pkg1 pkg2 ..."'; exit 1
+	fi
+	if [ ! -f $(PROVISION_STAMP) ]; then
+		echo "no provision layer yet -- run 'make image' first"; exit 1
+	fi
+	$(OVERLAY_SH)
+	trap umount_stack EXIT
+	mount_stack
+	# temporary working DNS in the chroot (the baked resolv.conf points into
+	# /run, which dangles here); the guest-runtime symlink is restored below
+	$(SUDO) rm -f $(MERGED)/etc/resolv.conf
+	$(SUDO) cp /etc/resolv.conf $(MERGED)/etc/resolv.conf
+	$(SUDO) mount -t proc  proc  $(MERGED)/proc
+	$(SUDO) mount -t sysfs sysfs $(MERGED)/sys
+	$(SUDO) mount --bind /dev     $(MERGED)/dev
+	$(SUDO) mount --bind /dev/pts $(MERGED)/dev/pts
+	$(SUDO) chroot $(MERGED) /bin/bash -euxc '\
+		export DEBIAN_FRONTEND=noninteractive; \
+		apt-get update; \
+		apt-get install -y $(PKGS); \
+		apt-get clean; \
+		rm -f /etc/resolv.conf; \
+		ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf'
+	touch $(PROVISION_STAMP)
+	echo ""
+	echo "Installed into the provision layer: $(PKGS)"
+	echo "Note: add them to DEV_PKGS to survive a future 'make reprovision'."
+
+install: install-pkgs
 	$(MAKE) image
 
 # ---- housekeeping ------------------------------------------------------------

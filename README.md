@@ -79,6 +79,7 @@ instead (port 2222 is forwarded): `make ssh`.
 | `make base`            | debootstrap Debian once, cache it as `base-<suite>.erofs`           |
 | `make provision`       | overlay layer on the base: kernel, dev tools, users, Claude Code    |
 | `make reprovision`     | wipe only the provision layer and redo it (cached base is reused)   |
+| `make install PKGS=..` | apt-install packages into the system image (incremental repack)     |
 | `make image`           | Pack the rootfs into the read-only erofs image + extract kernel     |
 | `make workspace`       | Create the writable workspace disk (only if it doesn't exist)       |
 | `make qemu`            | Boot the VM (serial console, virtio disks/net, SSH on host :2222)   |
@@ -218,7 +219,12 @@ build time or redirected:
 
 Consequences worth knowing: `apt install` and Claude Code's auto-updater do
 **not** work inside the guest — that's the point (provisioning sets
-`DISABLE_AUTOUPDATER=1` so it doesn't try). Project-level installs (pip
+`DISABLE_AUTOUPDATER=1` so it doesn't try). Adding a package is done from
+the host instead: `make install PKGS="htop strace"` chroots into the
+overlay layers, apt-installs, and repacks the image — an incremental
+operation, no reprovision needed. Packages added this way persist across
+image rebuilds but live only in the provision layer, so also add them to
+`DEV_PKGS` if they should survive a `make reprovision`. Project-level installs (pip
 venvs, `npm install` in a repo, cloned toolchains) work fine anywhere under
 `/workspace` or `~`. To change the *system* — add a package, update Claude
 Code — edit `DEV_PKGS` or the provisioning script and rebuild:
