@@ -5,7 +5,7 @@
 #   - Immutable erofs root filesystem
 #   - Persistent writable ext4 workspace disk mounted at /workspace
 #
-# Targets:
+# Targets (make help for a cheat sheet):
 #   make check-deps  - verify required host tools are installed
 #   make base        - debootstrap Debian once, cache it as $(BASE_IMG)
 #   make provision   - overlay on the base: kernel, dev tools, Claude Code
@@ -218,10 +218,32 @@ endef
 # ---- stamps -----------------------------------------------------------------
 PROVISION_STAMP := $(LAYERS)/.provision-done
 
-.PHONY: all check-deps base rootfs provision clean-provision reprovision image workspace qemu ssh import repos clone clean clean-workspace distclean
+.PHONY: help all check-deps base rootfs provision clean-provision reprovision image workspace qemu ssh import repos clone clean clean-workspace distclean
 
 # muscle-memory alias for the renamed stage
 rootfs: base
+
+define HELP
+Claustrum -- immutable Debian VM for Claude Code
+
+  make                  build everything (root image + workspace disk)
+  make qemu             boot the VM        make ssh   shell into it
+  make import REPO=url  put a repo in the guest git server
+  make repos            list guest repos   make clone NAME=n  clone to host
+  make reprovision      redo provisioning on the cached Debian base
+  make check-deps       verify host tools
+
+  Rebuild cost:  edit provisioning -> reprovision (minutes)
+                 new Debian base   -> distclean, then make (slow)
+  Safe to delete:  claustrum.erofs, layers/, vmlinuz, initrd.img
+  Never auto-deleted:  workspace.img (your repos + claude login)
+
+  Details, variables, troubleshooting: see README.md
+endef
+export HELP
+
+help:
+	@printf '%s\n' "$$HELP"
 
 all: image workspace
 
