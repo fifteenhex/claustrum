@@ -13,6 +13,10 @@
 #   make workspace   - create the writable workspace disk (only if missing)
 #   make qemu        - boot in QEMU (serial console, user networking)
 #   make ssh         - ssh into the running VM (port $(SSH_PORT))
+#   make import REPO=<url> [NAME=<n>] - mirror a repo into the guest git
+#                      server and create a working clone for Claude Code
+#   make repos       - list repositories hosted in the guest
+#   make clone NAME=<n> [DEST=<dir>]  - clone a guest repo onto the host
 #   make clean       - remove the rootfs image and extracted kernel
 #   make clean-workspace - remove the workspace disk (DELETES YOUR DATA)
 #   make distclean   - additionally remove the rootfs tree (needs sudo)
@@ -30,6 +34,11 @@
 #   - Ephemeral state (/tmp, /var/tmp, /var/log) is tmpfs.
 #   - Boots via qemu direct kernel boot (-kernel), so no bootloader needed.
 #   - Log in as $(DEVUSER) / $(DEVPASS) (or root / $(ROOTPASS)).
+#   - Git server: bare repos live in /workspace/git, working clones in
+#     /workspace/src. From the host:
+#       git clone ssh://$(DEVUSER)@localhost:$(SSH_PORT)/workspace/git/<name>.git
+#     If $(HOST_PUBKEY) exists it is baked into the image at `make image`
+#     time so host git/ssh access works without password prompts.
 # =============================================================================
 
 SHELL := /bin/bash
@@ -60,6 +69,16 @@ MEM        ?= 4G
 CPUS       ?= 2
 SSH_PORT   ?= 2222
 SUDO       ?= sudo
+
+# First existing host SSH public key; baked into the image (if present) so
+# ssh/git from the host needs no password. Override: make HOST_PUBKEY=path
+HOST_PUBKEY ?= $(firstword $(wildcard $(HOME)/.ssh/id_ed25519.pub $(HOME)/.ssh/id_ecdsa.pub $(HOME)/.ssh/id_rsa.pub))
+
+# Guest-side git layout and host-side ssh plumbing
+GUEST_GIT  := /workspace/git
+GUEST_SRC  := /workspace/src
+SSH_OPTS   := -p $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+GUEST_SSH  := ssh $(SSH_OPTS) $(DEVUSER)@localhost
 
 KERNEL     := $(CURDIR)/vmlinuz
 INITRD     := $(CURDIR)/initrd.img
@@ -98,6 +117,12 @@ define MOTD
                     on your host machine, paste the code back here
    * API key      : export ANTHROPIC_API_KEY=sk-ant-...  then run claude
 
+ Git server:
+   * bare repos      : /workspace/git   (host: make import REPO=<url>)
+   * working clones  : /workspace/src   <- work in these
+   * from the host   :
+       git clone ssh://$(DEVUSER)@localhost:$(SSH_PORT)/workspace/git/<name>.git
+
  Good to know:
    * Credentials persist in ~/.claude (lives on the workspace disk)
    * /           read-only erofs -- rebuild the image to change the OS
@@ -111,7 +136,7 @@ export MOTD
 DEBOOTSTRAP_STAMP := $(ROOTFS)/.debootstrap-done
 PROVISION_STAMP   := $(ROOTFS)/.provision-done
 
-.PHONY: all check-deps rootfs provision image workspace qemu ssh clean clean-workspace distclean
+.PHONY: all check-deps rootfs provision image workspace qemu ssh import repos clone clean clean-workspace distclean
 
 all: image workspace
 
@@ -137,6 +162,7 @@ check-deps:
 	check mkfs.ext4        e2fsprogs
 	check qemu-system-x86_64 qemu-system-x86
 	check ssh              openssh-client
+	check git              git
 	if [ -n "$$missing" ]; then
 		echo ""
 		echo "Missing host dependencies. Install them with:"
@@ -237,7 +263,15 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 		d /workspace/home 0755 root root -
 		C /workspace/home/$(DEVUSER) 0700 $(DEVUSER) $(DEVUSER) - /etc/skel
 		Z /workspace/home/$(DEVUSER) 0700 $(DEVUSER) $(DEVUSER) -
+		d /workspace/git 0755 $(DEVUSER) $(DEVUSER) -
+		d /workspace/src 0755 $(DEVUSER) $(DEVUSER) -
 		TMPF
+
+		# ssh: also accept keys from the immutable /etc so the host's public
+		# key can be baked into the image (dev's home doesn't exist yet)
+		mkdir -p /etc/ssh/authorized_keys
+		printf 'AuthorizedKeysFile /etc/ssh/authorized_keys/%%u .ssh/authorized_keys\n' \
+			> /etc/ssh/sshd_config.d/10-claustrum.conf
 
 		# networking: DHCP on any ethernet interface via systemd-networkd
 		cat > /etc/systemd/network/20-wired.network <<NET
@@ -294,6 +328,11 @@ $(IMG): $(PROVISION_STAMP) | check-deps
 	# Copy kernel + initrd out of the rootfs for qemu direct boot
 	$(SUDO) sh -c 'cp $(ROOTFS)/boot/vmlinuz-*  $(KERNEL) && cp $(ROOTFS)/boot/initrd.img-* $(INITRD)'
 	$(SUDO) chown $$(id -u):$$(id -g) $(KERNEL) $(INITRD)
+	# Bake the host's ssh public key (if any) for passwordless git access
+	if [ -n "$(HOST_PUBKEY)" ]; then
+		$(SUDO) install -m 644 -o root -g root $(HOST_PUBKEY) \
+			$(ROOTFS)/etc/ssh/authorized_keys/$(DEVUSER)
+	fi
 	# Build the erofs image directly from the directory tree
 	rm -f $(IMG)
 	$(SUDO) mkfs.erofs $(EROFS_OPTS) \
@@ -324,7 +363,39 @@ qemu: $(IMG) $(WS_IMG) | check-deps
 		-nographic
 
 ssh:
-	ssh -p $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(DEVUSER)@localhost
+	$(GUEST_SSH)
+
+# ---- 6. git server -----------------------------------------------------------
+# Mirror an upstream repo into the guest's git server and create a working
+# clone for Claude Code. Requires the VM to be running (make qemu).
+#   make import REPO=https://github.com/user/project.git [NAME=project]
+import: | check-deps
+	set -euo pipefail
+	if [ -z "$(REPO)" ]; then
+		echo "usage: make import REPO=<git-url> [NAME=<repo-name>]"; exit 1
+	fi
+	name="$(NAME)"; [ -n "$$name" ] || name="$$(basename "$(REPO)" .git)"
+	$(GUEST_SSH) "set -e; \
+		git clone --bare '$(REPO)' '$(GUEST_GIT)/$$name.git'; \
+		git -C '$(GUEST_GIT)/$$name.git' config receive.denyDeletes false; \
+		git clone '$(GUEST_GIT)/$$name.git' '$(GUEST_SRC)/$$name'"
+	echo ""
+	echo "Imported. Inside the guest, Claude Code works in: $(GUEST_SRC)/$$name"
+	echo "From the host:"
+	echo "  git clone ssh://$(DEVUSER)@localhost:$(SSH_PORT)$(GUEST_GIT)/$$name.git"
+
+# List repositories hosted in the guest
+repos: | check-deps
+	$(GUEST_SSH) "ls -1 $(GUEST_GIT) 2>/dev/null | sed 's/\.git$$//'" || true
+
+# Clone a guest repo onto the host: make clone NAME=project [DEST=dir]
+clone: | check-deps
+	set -euo pipefail
+	if [ -z "$(NAME)" ]; then
+		echo "usage: make clone NAME=<repo-name> [DEST=<dir>]"; exit 1
+	fi
+	GIT_SSH_COMMAND="ssh $(SSH_OPTS)" git clone \
+		ssh://$(DEVUSER)@localhost:$(SSH_PORT)$(GUEST_GIT)/$(NAME).git $(DEST)
 
 # ---- housekeeping ------------------------------------------------------------
 clean:

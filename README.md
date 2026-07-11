@@ -81,6 +81,9 @@ instead (port 2222 is forwarded): `make ssh`.
 | `make workspace`       | Create the writable workspace disk (only if it doesn't exist)       |
 | `make qemu`            | Boot the VM (serial console, virtio disks/net, SSH on host :2222)   |
 | `make ssh`             | SSH into the running VM as the dev user                             |
+| `make import REPO=url` | Mirror a repo into the guest git server + create a working clone    |
+| `make repos`           | List repositories hosted in the guest                               |
+| `make clone NAME=n`    | Clone a guest repo onto the host over SSH                           |
 | `make clean`           | Remove the root image, kernel, and initrd (workspace untouched)     |
 | `make clean-workspace` | Delete the workspace disk — **destroys your data**                  |
 | `make distclean`       | `clean` + remove the rootfs tree (needs sudo)                       |
@@ -107,9 +110,52 @@ top of the Makefile:
 | `ROOTPASS`   | `root`               | Guest root password                                |
 | `MEM` / `CPUS` | `4G` / `2`         | VM resources                                       |
 | `SSH_PORT`   | `2222`               | Host port forwarded to guest SSH                   |
+| `HOST_PUBKEY`| first `~/.ssh/id_*.pub` | Host SSH key baked into the image for passwordless access |
 | `DEV_PKGS`   | *(see Makefile)*     | Packages installed during provisioning             |
 
 Change the default passwords if the VM will be reachable by anyone but you.
+
+## The guest git server
+
+The guest doubles as a small git server so Claude Code can work on real
+repositories and you can pull its work back out over plain git. There is
+no daemon involved — it's bare repositories on the workspace disk served
+over the SSH connection that already exists:
+
+```
+/workspace/git/<name>.git   bare repos ("the server"), survive rebuilds
+/workspace/src/<name>       working clones -- where Claude Code works
+```
+
+**Import a repository** (VM must be running):
+
+```sh
+make import REPO=https://github.com/user/project.git
+```
+
+The guest mirrors the URL into `/workspace/git/project.git` and makes a
+working clone in `/workspace/src/project` whose `origin` is the local bare
+repo. Inside the VM, Claude Code commits and pushes to that origin like any
+other repo.
+
+**Access it from the host:**
+
+```sh
+make clone NAME=project          # or manually:
+git clone ssh://dev@localhost:2222/workspace/git/project.git
+```
+
+Host and guest are now two peers pushing/pulling through the same bare
+repo — review Claude's commits on the host, push fixes back, and the
+guest sees them with a `git pull`. Pushing back to the original upstream
+(e.g. GitHub) is deliberately left to you, from the host, with your own
+credentials: the sandbox never needs write access to the real remote.
+
+**Passwordless access:** if you have an SSH key (`~/.ssh/id_ed25519.pub`
+or similar), `make image` bakes it into `/etc/ssh/authorized_keys/dev` in
+the immutable image — sshd in the guest is configured to read keys from
+there, since the dev user's home doesn't exist until first boot. No key?
+Everything still works with the account password, just with more typing.
 
 ## How the immutability works
 
