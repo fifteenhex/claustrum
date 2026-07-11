@@ -81,6 +81,32 @@ DEV_PKGS := \
 	unzip zip file procps psmisc \
 	openssh-client netcat-openbsd iproute2 iputils-ping
 
+# Login banner, written to /etc/motd during provisioning. Kept in a define
+# (not in the recipe heredoc) because .ONESHELL strips leading whitespace and
+# @/-/+ prefix characters from every recipe line, which destroys ASCII layout.
+define MOTD
+=======================================================================
+ Claustrum -- an immutable enclosure for Claude Code
+-----------------------------------------------------------------------
+ Quick start:
+
+     cd /workspace
+     claude
+
+ First run, pick a login method:
+   * Subscription : run claude, open the printed URL in a browser
+                    on your host machine, paste the code back here
+   * API key      : export ANTHROPIC_API_KEY=sk-ant-...  then run claude
+
+ Good to know:
+   * Credentials persist in ~/.claude (lives on the workspace disk)
+   * /           read-only erofs -- rebuild the image to change the OS
+   * /workspace  writable, survives reboots and image rebuilds
+   * apt install and self-update do not work here, by design
+=======================================================================
+endef
+export MOTD
+
 # ---- stamps -----------------------------------------------------------------
 DEBOOTSTRAP_STAMP := $(ROOTFS)/.debootstrap-done
 PROVISION_STAMP   := $(ROOTFS)/.provision-done
@@ -243,6 +269,7 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 		# the immutable root can't self-update, so silence the auto-updater
 		echo 'DISABLE_AUTOUPDATER=1' >> /etc/environment
 
+
 		# system-wide git defaults (dev's home doesn't exist yet)
 		git config --system init.defaultBranch main
 
@@ -251,6 +278,9 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 		rm -f /etc/resolv.conf
 		ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 	EOF
+
+	# message of the day: launch instructions on every login
+	printf '%s\n' "$$MOTD" | $(SUDO) tee $(ROOTFS)/etc/motd >/dev/null
 
 	# restore the chroot-only resolv.conf hack (symlink was set inside)
 	$(SUDO) rm -f $(ROOTFS)/etc/resolv.conf.chroot
