@@ -122,6 +122,8 @@ define MOTD
    * working clones  : /workspace/src   <- work in these
    * from the host   :
        git clone ssh://$(DEVUSER)@localhost:$(SSH_PORT)/workspace/git/<name>.git
+   * Claude Code already knows this layout (claustrum-repos skill):
+       just ask it to "work on <name>" and it takes it from there
 
  Good to know:
    * Credentials persist in ~/.claude (lives on the workspace disk)
@@ -131,6 +133,53 @@ define MOTD
 =======================================================================
 endef
 export MOTD
+
+# A Claude Code "skill" baked into /etc/skel/.claude/skills, so it lands in
+# the dev user's ~/.claude/skills when the home is created on first boot.
+# Claude Code reads the description to decide when to load the skill.
+define CLAUDE_SKILL
+---
+name: claustrum-repos
+description: Working with git repositories inside this Claustrum sandbox VM. Use when asked to work on, clone, list, or set up a repository, or when starting any coding task that needs a repo.
+---
+
+# Repositories in Claustrum
+
+This machine is an immutable sandbox VM with a local git server. All
+repositories live on the writable workspace disk.
+
+## Layout
+
+- `/workspace/git/<name>.git` -- bare repositories: the local "server" and
+  the `origin` of every working clone. The user on the host pushes to and
+  fetches from these over SSH.
+- `/workspace/src/<name>` -- working clones. Do all work here.
+
+## Starting work on a repo
+
+1. Look in `/workspace/src`. If a working clone exists, `cd` into it and work.
+2. Otherwise look in `/workspace/git`. If `<name>.git` exists, clone it first:
+   `git clone /workspace/git/<name>.git /workspace/src/<name>`
+3. If the repo exists in neither place, it has not been imported yet. Ask
+   the user to run this on the HOST (not in this VM):
+   `make import REPO=<url>`
+
+## Committing and sharing work
+
+- Commit as usual and push to `origin` (the local bare repo). Push early and
+  often: the user reviews your commits from the host via the same bare repo,
+  and may push fixups you should `git pull`.
+- Never push to external remotes (GitHub, GitLab, ...). This sandbox has no
+  upstream credentials by design; publishing is the user's job on the host.
+
+## Environment constraints
+
+- The root filesystem is read-only: `apt install`, editing files outside
+  `/workspace` or `$$HOME`, and self-updates all fail. This is intentional.
+  Use project-level tooling instead (python venv, npm install in the repo).
+- `/workspace` and `$$HOME` persist across reboots; `/tmp` and `/var/log` do not.
+endef
+export CLAUDE_SKILL
 
 # ---- stamps -----------------------------------------------------------------
 DEBOOTSTRAP_STAMP := $(ROOTFS)/.debootstrap-done
@@ -315,6 +364,12 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 
 	# message of the day: launch instructions on every login
 	printf '%s\n' "$$MOTD" | $(SUDO) tee $(ROOTFS)/etc/motd >/dev/null
+
+	# Claude Code skill: teach the agent this VM's repo workflow. Lands in
+	# ~/.claude/skills via /etc/skel when the home is created on first boot.
+	$(SUDO) install -d $(ROOTFS)/etc/skel/.claude/skills/claustrum-repos
+	printf '%s\n' "$$CLAUDE_SKILL" | \
+		$(SUDO) tee $(ROOTFS)/etc/skel/.claude/skills/claustrum-repos/SKILL.md >/dev/null
 
 	# restore the chroot-only resolv.conf hack (symlink was set inside)
 	$(SUDO) rm -f $(ROOTFS)/etc/resolv.conf.chroot

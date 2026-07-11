@@ -145,6 +145,17 @@ make clone NAME=project          # or manually:
 git clone ssh://dev@localhost:2222/workspace/git/project.git
 ```
 
+**Claude Code knows all of this already.** Provisioning bakes a
+`claustrum-repos` skill into `/etc/skel/.claude/skills/`, which lands in the
+dev user's `~/.claude/skills/` when the home directory is created on first
+boot. The skill teaches the agent the layout above: where repos live, how to
+create a working clone from a bare repo, to push to the local origin early
+and often, never to push to external remotes, and what the read-only root
+means for its work. So inside the VM you can just say "work on project" and
+it takes it from there. One caveat: `/etc/skel` only populates *new* homes —
+if your workspace disk predates the skill, copy it in once from inside the
+guest: `cp -r /etc/skel/.claude/skills ~/.claude/`.
+
 Host and guest are now two peers pushing/pulling through the same bare
 repo — review Claude's commits on the host, push fixes back, and the
 guest sees them with a `git pull`. Pushing back to the original upstream
