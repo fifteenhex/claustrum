@@ -110,7 +110,7 @@ top of the Makefile:
 | `WS_SIZE`    | `20G`                | Workspace disk size (sparse; grows as used)        |
 | `DEVUSER` / `DEVPASS` | `dev` / `dev` | Guest user account                                |
 | `ROOTPASS`   | `root`               | Guest root password                                |
-| `MEM` / `CPUS` | `4G` / `2`         | VM resources                                       |
+| `MEM` / `CPUS` | `4G` / half of host cores | VM resources                                |
 | `SSH_PORT`   | `2222`               | Host port forwarded to guest SSH                   |
 | `HOST_PUBKEY`| first `~/.ssh/id_*.pub` | Host SSH key baked into the image for passwordless access |
 | `DEV_PKGS`   | *(see Makefile)*     | Packages installed during provisioning             |
@@ -278,6 +278,34 @@ compression). `check-deps` warns about this.
 after any provisioning change — the initramfs must contain the erofs
 module (provisioning adds it to `/etc/initramfs-tools/modules`). Kernel
 messages appear on the serial console because of `console=ttyS0`.
+
+**`claude` prints nothing and spins at 100% CPU.** Three guest-specific
+causes, all fixed in the current Makefile; triage with `claude --version`
+(does the binary run at all?) and `ping -c1 1.1.1.1` / `getent hosts
+api.anthropic.com` (is networking up?).
+*CPU model:* QEMU's default `qemu64` CPU hides modern instruction-set
+features from a binary that assumes them — provisioning's `claude
+--version` check runs on the *host* CPU in a chroot, so it can't catch
+this. The Makefile now passes `-cpu max` (all host features under KVM,
+all emulated features under TCG). Takes effect on the next `make qemu`,
+no rebuild.
+*Guest networking:* earlier revisions had a mismatch between
+`net.ifnames=0` on the kernel command line (interface named `eth0`) and a
+networkd match of `Name=en*` — the match is now `eth* en*`. Needs
+`make reprovision`.
+*Telemetry:* upstream issues tie renderer CPU spins to failing telemetry
+exports; the image sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` so
+the sandbox skips telemetry, update checks, and error reporting entirely.
+
+**`claude` misrenders or spins only on the serial console.**
+Serial lines report a 0x0 terminal size and getty defaults `TERM=vt220`;
+Claude Code's full-screen renderer can spin on that degenerate geometry. A
+login-shell snippet (`/etc/profile.d/serial-console.sh`) now sets
+`TERM=xterm-256color` and a 140x40 fallback size on ttyS* logins. On an
+image predating the fix: `stty rows 40 columns 140; export
+TERM=xterm-256color` and retry — or better, use `make ssh`, which
+negotiates real terminal dimensions and is the recommended way to run
+interactive claude sessions anyway.
 
 **QEMU is very slow.** You're on TCG. See the `/dev/kvm` note under
 Requirements.

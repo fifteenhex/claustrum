@@ -83,7 +83,8 @@ DEVUSER    ?= dev
 DEVPASS    ?= dev
 ROOTPASS   ?= root
 MEM        ?= 4G
-CPUS       ?= 2
+# Default to half the host's CPUs (minimum 1); override with make CPUS=n
+CPUS       ?= $(shell n=$$(nproc 2>/dev/null || echo 2); n=$$((n / 2)); [ $$n -ge 1 ] && echo $$n || echo 1)
 SSH_PORT   ?= 2222
 SUDO       ?= sudo
 
@@ -143,6 +144,8 @@ define MOTD
        just ask it to "work on <name>" and it takes it from there
 
  Good to know:
+   * For interactive claude sessions, ssh in from the host (make ssh):
+     a real terminal beats this serial console
    * Credentials persist in ~/.claude (lives on the workspace disk)
    * /           read-only erofs -- rebuild the image to change the OS
    * /workspace  writable, survives reboots and image rebuilds
@@ -214,6 +217,21 @@ umount_stack() {
 	$(SUDO) umount -l $(LOWER)  2>/dev/null || true
 }
 endef
+
+# Login-shell fixup for serial consoles: the kernel reports a 0x0 window
+# size on ttyS* and getty defaults TERM=vt220, which can send full-screen
+# TUI apps (like Claude Code) into a 100%-CPU render spin. qemu -nographic
+# forwards the host terminal, so xterm-256color is the accurate TERM.
+define SERIAL_PROFILE
+case "$$(tty 2>/dev/null)" in /dev/ttyS*)
+case "$$TERM" in vt220|vt102|linux|"") export TERM=xterm-256color ;; esac
+if [ "$$(stty size 2>/dev/null)" = "0 0" ]; then
+stty rows 40 columns 140
+fi
+;;
+esac
+endef
+export SERIAL_PROFILE
 
 # ---- stamps -----------------------------------------------------------------
 PROVISION_STAMP := $(LAYERS)/.provision-done
@@ -394,7 +412,7 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 		# networking: DHCP on any ethernet interface via systemd-networkd
 		cat > /etc/systemd/network/20-wired.network <<NET
 		[Match]
-		Name=en*
+		Name=eth* en*
 
 		[Network]
 		DHCP=yes
@@ -431,6 +449,10 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 
 		# the immutable root can't self-update, so silence the auto-updater
 		echo 'DISABLE_AUTOUPDATER=1' >> /etc/environment
+		# also skip telemetry/update-check/error-report traffic: upstream
+		# reports tie renderer CPU spins to failing telemetry exports, and a
+		# sandbox shouldn't phone home anyway
+		echo 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' >> /etc/environment
 
 
 		# system-wide git defaults (dev's home doesn't exist yet)
@@ -444,6 +466,10 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 
 	# message of the day: launch instructions on every login
 	printf '%s\n' "$$MOTD" | $(SUDO) tee $(MERGED)/etc/motd >/dev/null
+
+	# serial-console terminal fixup (see SERIAL_PROFILE comment above)
+	printf '%s\n' "$$SERIAL_PROFILE" | \
+		$(SUDO) tee $(MERGED)/etc/profile.d/serial-console.sh >/dev/null
 
 	# Claude Code skill: teach the agent this VM's repo workflow. Lands in
 	# ~/.claude/skills via /etc/skel when the home is created on first boot.
@@ -488,7 +514,7 @@ $(WS_IMG): | check-deps
 # ---- 5. boot it --------------------------------------------------------------
 qemu: $(IMG) $(WS_IMG) | check-deps
 	qemu-system-x86_64 \
-		-machine q35,accel=kvm:tcg \
+		-machine q35,accel=kvm:tcg -cpu max \
 		-m $(MEM) -smp $(CPUS) \
 		-kernel $(KERNEL) \
 		-initrd $(INITRD) \
