@@ -7,8 +7,10 @@
 #
 # Targets:
 #   make check-deps  - verify required host tools are installed
-#   make rootfs      - debootstrap a base Debian system into $(ROOTFS)
-#   make provision   - install kernel, dev tools, git, node, and Claude Code
+#   make base        - debootstrap Debian once, cache it as $(BASE_IMG)
+#   make provision   - overlay on the base: kernel, dev tools, Claude Code
+#   make reprovision - wipe ONLY the provision layer and redo it (base is
+#                      cached; no new debootstrap, no Debian re-download)
 #   make image       - pack the rootfs into a read-only erofs image
 #   make workspace   - create the writable workspace disk (only if missing)
 #   make qemu        - boot in QEMU (serial console, user networking)
@@ -19,7 +21,17 @@
 #   make clone NAME=<n> [DEST=<dir>]  - clone a guest repo onto the host
 #   make clean       - remove the rootfs image and extracted kernel
 #   make clean-workspace - remove the workspace disk (DELETES YOUR DATA)
-#   make distclean   - additionally remove the rootfs tree (needs sudo)
+#   make distclean   - additionally remove the overlay layers and cached base
+#
+# Staging (erofs + overlayfs):
+#   Stage 1's output is itself an erofs image, $(BASE_IMG): the pristine
+#   debootstrap result, made once and cached. Stage 2 loop-mounts it
+#   read-only and stacks a writable overlayfs upper layer on top; all
+#   provisioning writes land in $(UPPER), never touching the base. The
+#   final $(IMG) is packed from the merged view. Redoing provisioning is
+#   therefore just discarding the upper layer (make reprovision) -- the
+#   same immutable-lower/writable-upper split the final VM uses, applied
+#   to the build itself.
 #
 # Host requirements (Debian/Ubuntu):
 #   sudo apt install debootstrap qemu-system-x86 e2fsprogs erofs-utils
@@ -56,7 +68,12 @@ ARCH       ?= amd64
 # current stable codename) if you prefer a stable base.
 SUITE      ?= testing
 MIRROR     ?= http://deb.debian.org/debian
-ROOTFS     ?= $(CURDIR)/rootfs
+BASE_IMG   ?= $(CURDIR)/base-$(SUITE).erofs
+LAYERS     ?= $(CURDIR)/layers
+LOWER      := $(LAYERS)/lower
+UPPER      := $(LAYERS)/upper
+OVLWORK    := $(LAYERS)/work
+MERGED     := $(LAYERS)/merged
 IMG        ?= $(CURDIR)/claustrum.erofs
 EROFS_OPTS ?= -zlz4hc
 WS_IMG     ?= $(CURDIR)/workspace.img
@@ -181,11 +198,30 @@ repositories live on the writable workspace disk.
 endef
 export CLAUDE_SKILL
 
-# ---- stamps -----------------------------------------------------------------
-DEBOOTSTRAP_STAMP := $(ROOTFS)/.debootstrap-done
-PROVISION_STAMP   := $(ROOTFS)/.provision-done
+# Shell helpers to mount/unmount the erofs-lower + overlay-upper build stack.
+# Expanded inside .ONESHELL recipes; the content survives verbatim because
+# variable expansion happens after make's recipe-line processing.
+define OVERLAY_SH
+mount_stack() {
+	$(SUDO) mkdir -p $(LOWER) $(UPPER) $(OVLWORK) $(MERGED)
+	$(SUDO) mount -t erofs -o loop,ro $(BASE_IMG) $(LOWER)
+	$(SUDO) mount -t overlay overlay \
+		-o lowerdir=$(LOWER),upperdir=$(UPPER),workdir=$(OVLWORK) $(MERGED)
+}
+umount_stack() {
+	$(SUDO) umount -l $(MERGED)/dev/pts $(MERGED)/dev $(MERGED)/sys $(MERGED)/proc 2>/dev/null || true
+	$(SUDO) umount -l $(MERGED) 2>/dev/null || true
+	$(SUDO) umount -l $(LOWER)  2>/dev/null || true
+}
+endef
 
-.PHONY: all check-deps rootfs provision image workspace qemu ssh import repos clone clean clean-workspace distclean
+# ---- stamps -----------------------------------------------------------------
+PROVISION_STAMP := $(LAYERS)/.provision-done
+
+.PHONY: all check-deps base rootfs provision clean-provision reprovision image workspace qemu ssh import repos clone clean clean-workspace distclean
+
+# muscle-memory alias for the renamed stage
+rootfs: base
 
 all: image workspace
 
@@ -225,43 +261,54 @@ check-deps:
 	if [ ! -w /dev/kvm ]; then
 		echo "warning: /dev/kvm not accessible; qemu will fall back to slow TCG emulation"
 	fi
+	if ! grep -qw erofs /proc/filesystems && ! modinfo erofs >/dev/null 2>&1; then
+		echo "warning: host kernel appears to lack erofs support; the build"
+		echo "         loop-mounts the cached base image and will fail without it"
+	fi
 	echo "All host dependencies present."
 
-# ---- 1. debootstrap the base system -----------------------------------------
-rootfs: $(DEBOOTSTRAP_STAMP)
+# ---- 1. debootstrap once, cache the result as an erofs image ----------------
+base: $(BASE_IMG)
 
-$(DEBOOTSTRAP_STAMP): | check-deps
+$(BASE_IMG): | check-deps
 	set -euo pipefail
+	scratch=$(LAYERS)/base-root
+	$(SUDO) rm -rf "$$scratch"
+	mkdir -p $(LAYERS)
 	$(SUDO) debootstrap \
 		--arch=$(ARCH) \
 		--include=$(BASE_PKGS) \
-		$(SUITE) $(ROOTFS) $(MIRROR)
-	$(SUDO) touch $@
+		$(SUITE) "$$scratch" $(MIRROR)
+	$(SUDO) mkfs.erofs $(EROFS_OPTS) $@ "$$scratch"
+	$(SUDO) chown $$(id -u):$$(id -g) $@
+	$(SUDO) rm -rf "$$scratch"
+
 
 # ---- 2. provision: kernel, tools, user, networking, claude ------------------
 provision: $(PROVISION_STAMP)
 
-$(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
+$(PROVISION_STAMP): $(BASE_IMG) | check-deps
 	set -euo pipefail
+	$(OVERLAY_SH)
+	trap umount_stack EXIT
+
+	# Stack a writable overlay on the read-only cached base: everything
+	# below writes into $(UPPER); $(BASE_IMG) is never modified
+	mount_stack
 
 	# DNS inside the chroot (rm first: resolv.conf may be a dangling symlink
 	# left by systemd-resolved from a previous partial provisioning run)
-	$(SUDO) rm -f $(ROOTFS)/etc/resolv.conf.chroot $(ROOTFS)/etc/resolv.conf
-	$(SUDO) cp /etc/resolv.conf $(ROOTFS)/etc/resolv.conf.chroot
-	$(SUDO) cp /etc/resolv.conf $(ROOTFS)/etc/resolv.conf
+	$(SUDO) rm -f $(MERGED)/etc/resolv.conf.chroot $(MERGED)/etc/resolv.conf
+	$(SUDO) cp /etc/resolv.conf $(MERGED)/etc/resolv.conf.chroot
+	$(SUDO) cp /etc/resolv.conf $(MERGED)/etc/resolv.conf
 
 	# Bind mounts needed by apt/npm inside the chroot
-	$(SUDO) mount -t proc  proc  $(ROOTFS)/proc
-	$(SUDO) mount -t sysfs sysfs $(ROOTFS)/sys
-	$(SUDO) mount --bind /dev     $(ROOTFS)/dev
-	$(SUDO) mount --bind /dev/pts $(ROOTFS)/dev/pts
+	$(SUDO) mount -t proc  proc  $(MERGED)/proc
+	$(SUDO) mount -t sysfs sysfs $(MERGED)/sys
+	$(SUDO) mount --bind /dev     $(MERGED)/dev
+	$(SUDO) mount --bind /dev/pts $(MERGED)/dev/pts
 
-	cleanup() {
-		$(SUDO) umount -l $(ROOTFS)/dev/pts $(ROOTFS)/dev $(ROOTFS)/sys $(ROOTFS)/proc || true
-	}
-	trap cleanup EXIT
-
-	$(SUDO) chroot $(ROOTFS) /bin/bash -eux <<-'EOF'
+	$(SUDO) chroot $(MERGED) /bin/bash -eux <<-'EOF'
 		export DEBIAN_FRONTEND=noninteractive
 
 		# hostname / hosts
@@ -343,10 +390,14 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 		FSTAB
 
 		# Claude Code -- baked into the immutable image.
-		# NOTE: do NOT use --ignore-scripts here: the npm package ships a
-		# native binary via per-platform optional dependencies and links it
-		# into place in a postinstall step; skipping scripts breaks it.
-		npm install -g @anthropic-ai/claude-code
+		# NOTE 1: do NOT use --ignore-scripts: the npm package ships a native
+		# binary via a per-platform optional dependency and links it into
+		# place in a postinstall step; skipping scripts breaks it.
+		# NOTE 2: npm v12 (July 2026) blocks dependency install scripts by
+		# default, silently skipping that same postinstall -- so the package
+		# must be explicitly allowed. Older npm ignores the unknown flag with
+		# a warning and runs scripts by default, so this stays compatible.
+		npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
 		claude --version
 
 		# the immutable root can't self-update, so silence the auto-updater
@@ -363,36 +414,38 @@ $(PROVISION_STAMP): $(DEBOOTSTRAP_STAMP) | check-deps
 	EOF
 
 	# message of the day: launch instructions on every login
-	printf '%s\n' "$$MOTD" | $(SUDO) tee $(ROOTFS)/etc/motd >/dev/null
+	printf '%s\n' "$$MOTD" | $(SUDO) tee $(MERGED)/etc/motd >/dev/null
 
 	# Claude Code skill: teach the agent this VM's repo workflow. Lands in
 	# ~/.claude/skills via /etc/skel when the home is created on first boot.
-	$(SUDO) install -d $(ROOTFS)/etc/skel/.claude/skills/claustrum-repos
+	$(SUDO) install -d $(MERGED)/etc/skel/.claude/skills/claustrum-repos
 	printf '%s\n' "$$CLAUDE_SKILL" | \
-		$(SUDO) tee $(ROOTFS)/etc/skel/.claude/skills/claustrum-repos/SKILL.md >/dev/null
+		$(SUDO) tee $(MERGED)/etc/skel/.claude/skills/claustrum-repos/SKILL.md >/dev/null
 
 	# restore the chroot-only resolv.conf hack (symlink was set inside)
-	$(SUDO) rm -f $(ROOTFS)/etc/resolv.conf.chroot
-	$(SUDO) touch $@
+	$(SUDO) rm -f $(MERGED)/etc/resolv.conf.chroot
+	touch $@
 
 # ---- 3. pack rootfs into a read-only erofs image, extract kernel/initrd -----
 image: $(IMG)
 
 $(IMG): $(PROVISION_STAMP) | check-deps
 	set -euo pipefail
-	# Copy kernel + initrd out of the rootfs for qemu direct boot
-	$(SUDO) sh -c 'cp $(ROOTFS)/boot/vmlinuz-*  $(KERNEL) && cp $(ROOTFS)/boot/initrd.img-* $(INITRD)'
+	$(OVERLAY_SH)
+	trap umount_stack EXIT
+	mount_stack
+	# Copy kernel + initrd out of the merged view for qemu direct boot
+	$(SUDO) sh -c 'cp $(MERGED)/boot/vmlinuz-*  $(KERNEL) && cp $(MERGED)/boot/initrd.img-* $(INITRD)'
 	$(SUDO) chown $$(id -u):$$(id -g) $(KERNEL) $(INITRD)
-	# Bake the host's ssh public key (if any) for passwordless git access
+	# Bake the host's ssh public key (if any) for passwordless git access;
+	# done here (not in provisioning) so a key swap is just `make clean image`
 	if [ -n "$(HOST_PUBKEY)" ]; then
 		$(SUDO) install -m 644 -o root -g root $(HOST_PUBKEY) \
-			$(ROOTFS)/etc/ssh/authorized_keys/$(DEVUSER)
+			$(MERGED)/etc/ssh/authorized_keys/$(DEVUSER)
 	fi
-	# Build the erofs image directly from the directory tree
+	# Pack the merged (cached base + provision layer) view into the image
 	rm -f $(IMG)
-	$(SUDO) mkfs.erofs $(EROFS_OPTS) \
-		--exclude-regex '^\.(debootstrap|provision)-done$$' \
-		$(IMG) $(ROOTFS)
+	$(SUDO) mkfs.erofs $(EROFS_OPTS) $(IMG) $(MERGED)
 	$(SUDO) chown $$(id -u):$$(id -g) $(IMG)
 
 # ---- 4. writable workspace disk (persistent; never rebuilt if present) ------
@@ -452,6 +505,19 @@ clone: | check-deps
 	GIT_SSH_COMMAND="ssh $(SSH_OPTS)" git clone \
 		ssh://$(DEVUSER)@localhost:$(SSH_PORT)$(GUEST_GIT)/$(NAME).git $(DEST)
 
+# Throw away ONLY the overlay provision layer; the cached base is untouched
+clean-provision:
+	set -euo pipefail
+	$(OVERLAY_SH)
+	umount_stack
+	$(SUDO) rm -rf $(UPPER) $(OVLWORK) $(MERGED) $(LOWER)
+	rm -f $(PROVISION_STAMP) $(IMG)
+
+# Redo provisioning from the pristine cached base: no debootstrap,
+# no Debian re-download -- typically the apt mirror fetch is all that's left
+reprovision: clean-provision
+	$(MAKE) image
+
 # ---- housekeeping ------------------------------------------------------------
 clean:
 	rm -f $(IMG) $(KERNEL) $(INITRD)
@@ -461,4 +527,8 @@ clean-workspace:
 	rm -f $(WS_IMG)
 
 distclean: clean
-	$(SUDO) rm -rf $(ROOTFS)
+	set -euo pipefail
+	$(OVERLAY_SH)
+	umount_stack
+	$(SUDO) rm -rf $(LAYERS)
+	rm -f $(BASE_IMG)

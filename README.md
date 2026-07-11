@@ -75,8 +75,9 @@ instead (port 2222 is forwarded): `make ssh`.
 | Target                 | What it does                                                        |
 | ---------------------- | ------------------------------------------------------------------- |
 | `make check-deps`      | Verify required host tools; print `apt install` line for the rest   |
-| `make rootfs`          | debootstrap a base Debian system into `./rootfs`                    |
-| `make provision`       | chroot in; install kernel, dev tools, users, networking, and claude |
+| `make base`            | debootstrap Debian once, cache it as `base-<suite>.erofs`           |
+| `make provision`       | overlay layer on the base: kernel, dev tools, users, Claude Code    |
+| `make reprovision`     | wipe only the provision layer and redo it (cached base is reused)   |
 | `make image`           | Pack the rootfs into the read-only erofs image + extract kernel     |
 | `make workspace`       | Create the writable workspace disk (only if it doesn't exist)       |
 | `make qemu`            | Boot the VM (serial console, virtio disks/net, SSH on host :2222)   |
@@ -86,7 +87,7 @@ instead (port 2222 is forwarded): `make ssh`.
 | `make clone NAME=n`    | Clone a guest repo onto the host over SSH                           |
 | `make clean`           | Remove the root image, kernel, and initrd (workspace untouched)     |
 | `make clean-workspace` | Delete the workspace disk — **destroys your data**                  |
-| `make distclean`       | `clean` + remove the rootfs tree (needs sudo)                       |
+| `make distclean`       | `clean` + remove the overlay layers and the cached base image       |
 
 `make` with no arguments builds `image` and `workspace`. The dependency
 check runs automatically before every real target, as an order-only
@@ -168,6 +169,38 @@ the immutable image — sshd in the guest is configured to read keys from
 there, since the dev user's home doesn't exist until first boot. No key?
 Everything still works with the account password, just with more typing.
 
+## Build caching: erofs all the way down
+
+The build has two stages, and the cache boundary between them uses the same
+mechanism as the final VM: an immutable erofs layer with a writable layer
+on top.
+
+Stage 1 (`make base`) runs debootstrap once and packs the pristine result
+into `base-<suite>.erofs`. That file *is* the cache — the scratch directory
+is deleted afterwards. Stage 2 (`make provision`) loop-mounts the base
+read-only and stacks an overlayfs upper directory on it; every provisioning
+write (apt packages, Claude Code, config) lands in `layers/upper/`, and the
+base image is never modified. The final root image is packed from the
+merged view.
+
+This makes redoing provisioning cheap and *clean*:
+
+```sh
+make reprovision      # drop layers/upper, re-run provisioning, repack image
+```
+
+No new debootstrap, no re-downloading the Debian base — and unlike
+re-running provisioning in a shared tree, there's no residue: appends to
+files like `/etc/environment` can't accumulate duplicates because every
+reprovision starts from the untouched base layer. Iterate on `DEV_PKGS`,
+the MOTD, or the Claude Code install with a minutes-long loop instead of a
+full rebuild. `make distclean` is only needed when you want a *newer
+Debian base* (e.g. testing has moved on), since the cached base is frozen
+at whatever debootstrap fetched.
+
+Note the host mounts (loop + overlay) require sudo and a kernel with erofs
+support — `check-deps` warns if the erofs module looks absent.
+
 ## How the immutability works
 
 The root disk is erofs, a read-only filesystem — there is no remount-rw
@@ -215,8 +248,7 @@ out for initramfs-tools if needed).
 
 **`Failed to enable unit: Unit systemd-resolved.service does not exist`.**
 Since Debian 12, `systemd-resolved` is a separate package. It's included in
-`DEV_PKGS`; if you see this, your rootfs predates the fix — rebuild with
-`sudo make distclean && make`.
+`DEV_PKGS`; if you see this, your build predates the fix — `make reprovision`.
 
 **DNS fails during provisioning (npm step).** Installing systemd-resolved
 replaces `/etc/resolv.conf` with a symlink that dangles inside a chroot.
@@ -226,13 +258,17 @@ symlink from an interrupted run is also handled on re-run.
 
 **`claude: command not found` after provisioning.** The npm package
 delivers a native binary through per-platform optional dependencies plus a
-postinstall step that links it into place. If you customized the install,
-make sure you did **not** pass `--ignore-scripts` and that optional
-dependencies are enabled — either breaks the install. Provisioning runs
-`claude --version` and fails loudly if the binary is missing. Debian
-testing's Node satisfies the npm package's engine requirement, and even on
-older Node the install only prints an `EBADENGINE` warning — the installed
-binary doesn't use the system Node at runtime.
+postinstall step that links it into place — and there are two ways to lose
+that step. First, `--ignore-scripts` or disabled optional dependencies
+break the install outright. Second, npm v12 (July 2026, already in Debian
+testing) blocks dependency install scripts by default and *silently skips*
+the postinstall with only a warning — the install exits 0 but no binary
+appears. Provisioning therefore installs with
+`--allow-scripts=@anthropic-ai/claude-code` (older npm ignores the flag
+and runs scripts anyway) and runs `claude --version` to fail loudly if the
+binary is missing. Node version is a non-issue: even on older Node the
+install only prints an `EBADENGINE` warning — the installed binary doesn't
+use the system Node at runtime.
 
 **`mkfs.erofs: unknown compression` or similar.** Your erofs-utils build
 lacks lz4hc. Build with `EROFS_OPTS=-zzstd` or `EROFS_OPTS=` (no
@@ -250,10 +286,12 @@ Requirements.
 
 ```
 Makefile            the whole build
-rootfs/             debootstrapped tree (build artifact, root-owned)
-claustrum.erofs     immutable root image        -> /dev/vda, mounted ro at /
+base-testing.erofs  cached pristine debootstrap result (stage 1 output)
+layers/upper/       overlayfs upper dir: everything provisioning added
+layers/{lower,work,merged}/  mountpoints used during builds
+claustrum.erofs     final root image (base + provision merged) -> /dev/vda, ro at /
 workspace.img       writable workspace image    -> /dev/vdb, mounted at /workspace
-vmlinuz, initrd.img kernel + initramfs extracted from the rootfs for -kernel boot
+vmlinuz, initrd.img kernel + initramfs extracted from the image for -kernel boot
 ```
 
 ## Security notes
