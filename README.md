@@ -18,7 +18,8 @@ machine for running [Claude Code](https://code.claude.com) safely shut in:
   the root image.
 - **Batteries included** — Debian *testing* with git, build-essential,
   Python 3 (pip/venv), Node.js, ripgrep, fd, jq, tmux, vim, an SSH server,
-  and Claude Code itself (`@anthropic-ai/claude-code`) preinstalled.
+  and Claude Code itself preinstalled from Anthropic's signed apt
+  repository.
 - **No bootloader** — the VM boots via QEMU direct kernel boot (`-kernel`),
   so there is no grub or EFI partition to manage.
 
@@ -256,19 +257,18 @@ The provisioning script restores a working resolv.conf after the apt step
 and only re-creates the symlink at the very end. A leftover dangling
 symlink from an interrupted run is also handled on re-run.
 
-**`claude: command not found` after provisioning.** The npm package
-delivers a native binary through per-platform optional dependencies plus a
-postinstall step that links it into place — and there are two ways to lose
-that step. First, `--ignore-scripts` or disabled optional dependencies
-break the install outright. Second, npm v12 (July 2026, already in Debian
-testing) blocks dependency install scripts by default and *silently skips*
-the postinstall with only a warning — the install exits 0 but no binary
-appears. Provisioning therefore installs with
-`--allow-scripts=@anthropic-ai/claude-code` (older npm ignores the flag
-and runs scripts anyway) and runs `claude --version` to fail loudly if the
-binary is missing. Node version is a non-issue: even on older Node the
-install only prints an `EBADENGINE` warning — the installed binary doesn't
-use the system Node at runtime.
+**`claude: command not found` after provisioning.** Claude Code is
+installed from Anthropic's signed apt repository
+(`downloads.claude.ai/claude-code/apt/stable`); provisioning verifies the
+release key's published fingerprint before trusting it and asserts
+`claude --version` so a broken install fails the build loudly. Earlier
+revisions installed via npm and were repeatedly broken by npm v12's new
+install-script blocking (the package's postinstall — which links the
+native binary into place — was silently skipped, leaving a successful-
+looking install with no binary). If you're on the npm variant and hit
+this, `make reprovision` with the current Makefile. To get a newer Claude
+Code later, bump the image: it's one `make reprovision` away, or switch
+the repo line to the `latest` channel in the provisioning script.
 
 **`mkfs.erofs: unknown compression` or similar.** Your erofs-utils build
 lacks lz4hc. Build with `EROFS_OPTS=-zzstd` or `EROFS_OPTS=` (no

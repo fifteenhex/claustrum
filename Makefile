@@ -389,15 +389,22 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 		tmpfs    /var/log   tmpfs defaults            0 0
 		FSTAB
 
-		# Claude Code -- baked into the immutable image.
-		# NOTE 1: do NOT use --ignore-scripts: the npm package ships a native
-		# binary via a per-platform optional dependency and links it into
-		# place in a postinstall step; skipping scripts breaks it.
-		# NOTE 2: npm v12 (July 2026) blocks dependency install scripts by
-		# default, silently skipping that same postinstall -- so the package
-		# must be explicitly allowed. Older npm ignores the unknown flag with
-		# a warning and runs scripts by default, so this stays compatible.
-		npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
+		# Claude Code -- baked into the immutable image, installed from
+		# Anthropic's signed apt repository. This deliberately avoids the npm
+		# route: npm v12 (July 2026) blocks install scripts by default and the
+		# package needs its postinstall to link the native binary into place;
+		# apt has no such moving parts and verifies package signatures itself.
+		install -d -m 0755 /etc/apt/keyrings
+		curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+			-o /etc/apt/keyrings/claude-code.asc
+		# verify the published release-key fingerprint before trusting it
+		gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc \
+			| grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'
+		echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+			> /etc/apt/sources.list.d/claude-code.list
+		apt-get update
+		apt-get install -y claude-code
+		apt-get clean
 		claude --version
 
 		# the immutable root can't self-update, so silence the auto-updater
