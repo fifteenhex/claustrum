@@ -34,7 +34,7 @@ directory is exactly the kind of container that makes that reasonable.
 A Debian or Ubuntu host with:
 
 ```sh
-sudo apt install debootstrap qemu-system-x86 e2fsprogs erofs-utils
+sudo apt install debootstrap qemu-system-x86 qemu-utils e2fsprogs erofs-utils
 ```
 
 `make check-deps` verifies all of this and prints the exact install command
@@ -83,11 +83,17 @@ instead (port 2222 is forwarded): `make ssh`.
 | `make image`           | Pack the rootfs into the read-only erofs image + extract kernel     |
 | `make workspace`       | Create the writable workspace disk (only if it doesn't exist)       |
 | `make qemu`            | Boot the VM (serial console, virtio disks/net, SSH on host :2222)   |
+| `make serial-attach SERIAL_DEV=..` | Hot-plug a serial device into the running guest (Ctrl-C unplugs) |
+| `make serial-log`      | Follow the serial traffic log (both directions, hex + text)         |
 | `make ssh`             | SSH into the running VM as the dev user                             |
 | `make import REPO=url` | Mirror a repo into the guest git server + create a working clone    |
 | `make repos`           | List repositories hosted in the guest                               |
 | `make clone NAME=n`    | Clone a guest repo onto the host over SSH                           |
+| `make put SRC=path`    | Copy host files/dirs into the guest (default `/workspace/files/`)   |
+| `make get SRC=path`    | Copy guest files/dirs back to the host (absolute guest path)        |
+| `make pull FILE=path`  | Like `get`, but the path is relative to `/workspace`                |
 | `make clean`           | Remove the root image, kernel, and initrd (workspace untouched)     |
+| `make convert-workspace` | One-time migration of an old raw `workspace.img` to qcow2         |
 | `make clean-workspace` | Delete the workspace disk — **destroys your data**                  |
 | `make distclean`       | `clean` + remove the overlay layers and the cached base image       |
 
@@ -107,16 +113,40 @@ top of the Makefile:
 | `MIRROR`     | `deb.debian.org`     | Debian mirror                                      |
 | `IMG`        | `claustrum.erofs`    | Root filesystem image path                         |
 | `EROFS_OPTS` | `-zlz4hc`            | mkfs.erofs options (try `-zzstd` or empty)         |
-| `WS_IMG`     | `workspace.img`      | Workspace disk path                                |
-| `WS_SIZE`    | `20G`                | Workspace disk size (sparse; grows as used)        |
+| `WS_IMG`     | `workspace.qcow2`    | Workspace disk path (qcow2)                        |
+| `WS_SIZE`    | `64G`                | Workspace virtual size (qcow2 grows as used)       |
 | `DEVUSER` / `DEVPASS` | `dev` / `dev` | Guest user account                                |
 | `ROOTPASS`   | `root`               | Guest root password                                |
-| `MEM` / `CPUS` | `4G` / half of host cores | VM resources                                |
+| `MEM` / `CPUS` | `16G` / half of host cores | VM resources                                |
 | `SSH_PORT`   | `2222`               | Host port forwarded to guest SSH                   |
 | `HOST_PUBKEY`| first `~/.ssh/id_*.pub` | Host SSH key baked into the image for passwordless access |
 | `DEV_PKGS`   | *(see Makefile)*     | Packages installed during provisioning             |
 
 Change the default passwords if the VM will be reachable by anyone but you.
+
+## Sharing serial devices, on demand
+
+The guest's second serial port (`/dev/ttyS1`) always exists: QEMU exposes
+it as a TCP socket listening on `localhost:7777` (`SERIAL_PORT`). Nothing
+is decided at boot — you plug devices in and out of a *running* VM:
+
+```sh
+make serial-attach SERIAL_DEV=/dev/ttyUSB0 SERIAL_BAUD=115200
+```
+
+runs in the foreground, streaming every byte in both directions to your
+terminal as timestamped hex+text (`>` guest-to-device, `<` device-to-
+guest) and appending to `serial-tap.log` (`make serial-log` follows it
+from another terminal). **Ctrl-C is the unplug**; re-run to re-plug,
+swap `SERIAL_DEV` to plug a different adapter — no VM restart, ever.
+
+Caveats: while detached, guest writes to `ttyS1` are discarded and reads
+block — that's the semantics of an unplugged cable. The relay pins the
+physical port at `SERIAL_BAUD`; guest termios changes on `ttyS1` don't
+reach the real adapter. The listener binds to 127.0.0.1 only, so
+nothing off-host can reach it. Needs `socat`
+(checked at attach time, not a base requirement). The guest `dev` user is
+in `dialout`, so no sudo is needed to open `ttyS1`.
 
 ## The guest git server
 
@@ -147,6 +177,14 @@ other repo.
 make clone NAME=project          # or manually:
 git clone ssh://dev@localhost:2222/workspace/git/project.git
 ```
+
+**Moving loose files** works the same way as repos, over the existing SSH
+channel: `make put SRC=./data.csv` drops files into `/workspace/files/`
+(or anywhere with `DEST=`), and `make pull FILE=files/out.pdf`
+(or `make get` with an absolute guest path) brings results back. Directories work too (`scp -r`). The baked-in skill
+tells Claude Code to look in `/workspace/files` when you mention having
+shared a file, and to leave deliverables under `/workspace` and tell you
+the path.
 
 **Claude Code knows all of this already.** Provisioning bakes a
 `claustrum-repos` skill into `/etc/skel/.claude/skills/`, which lands in the
@@ -236,6 +274,15 @@ sudo make distclean && make
 The workspace disk is never touched by `clean` or `distclean`, so your
 checkouts and Claude Code credentials survive every rebuild.
 
+The workspace is a qcow2 image: 64G virtual, but on disk it only occupies
+what's actually written. Growing it later is two steps with no data loss:
+`qemu-img resize workspace.qcow2 128G` (VM off), then boot — a
+`workspace-grow` service in the guest runs `resize2fs` on every boot and
+expands the filesystem to fill the disk (a no-op otherwise). Migrating
+from the old raw format: shut the VM down and run `make convert-workspace`
+— it converts `workspace.img` to `workspace.qcow2`, resizes to `WS_SIZE`,
+and keeps the raw original untouched until you delete it yourself.
+
 ## Troubleshooting
 
 **`check-deps` says a tool is missing but the package is installed.**
@@ -324,7 +371,7 @@ base-testing.erofs  cached pristine debootstrap result (stage 1 output)
 layers/upper/       overlayfs upper dir: everything provisioning added
 layers/{lower,work,merged}/  mountpoints used during builds
 claustrum.erofs     final root image (base + provision merged) -> /dev/vda, ro at /
-workspace.img       writable workspace image    -> /dev/vdb, mounted at /workspace
+workspace.qcow2     writable workspace disk     -> /dev/vdb, mounted at /workspace
 vmlinuz, initrd.img kernel + initramfs extracted from the image for -kernel boot
 ```
 

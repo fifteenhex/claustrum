@@ -16,11 +16,18 @@
 #   make image       - pack the rootfs into a read-only erofs image
 #   make workspace   - create the writable workspace disk (only if missing)
 #   make qemu        - boot in QEMU (serial console, user networking)
+#   make serial-attach SERIAL_DEV=/dev/ttyUSB0 - hot-plug a serial device
+#                      into the running guest's /dev/ttyS1 (Ctrl-C unplugs)
+#   make serial-log  - follow the serial traffic log
 #   make ssh         - ssh into the running VM (port $(SSH_PORT))
 #   make import REPO=<url> [NAME=<n>] - mirror a repo into the guest git
 #                      server and create a working clone for Claude Code
 #   make repos       - list repositories hosted in the guest
 #   make clone NAME=<n> [DEST=<dir>]  - clone a guest repo onto the host
+#   make convert-workspace - migrate an old raw workspace.img to qcow2
+#   make put SRC=<p> [DEST=<p>] - copy host files/dirs into the guest
+#   make get SRC=<p> [DEST=<p>] - copy guest files/dirs back to the host
+#   make pull FILE=<p> [DEST=<p>] - like get, but relative to /workspace
 #   make clean       - remove the rootfs image and extracted kernel
 #   make clean-workspace - remove the workspace disk (DELETES YOUR DATA)
 #   make distclean   - additionally remove the overlay layers and cached base
@@ -78,13 +85,15 @@ OVLWORK    := $(LAYERS)/work
 MERGED     := $(LAYERS)/merged
 IMG        ?= $(CURDIR)/claustrum.erofs
 EROFS_OPTS ?= -zlz4hc
-WS_IMG     ?= $(CURDIR)/workspace.img
-WS_SIZE    ?= 20G
+WS_IMG     ?= $(CURDIR)/workspace.qcow2
+WS_SIZE    ?= 64G
+# previous raw-format workspace, for `make convert-workspace`
+WS_OLD_RAW ?= $(CURDIR)/workspace.img
 VMNAME     ?= claustrum
 DEVUSER    ?= dev
 DEVPASS    ?= dev
 ROOTPASS   ?= root
-MEM        ?= 4G
+MEM        ?= 16G
 # Default to half the host's CPUs (minimum 1); override with make CPUS=n
 CPUS       ?= $(shell n=$$(nproc 2>/dev/null || echo 2); n=$$((n / 2)); [ $$n -ge 1 ] && echo $$n || echo 1)
 SSH_PORT   ?= 2222
@@ -94,11 +103,23 @@ SUDO       ?= sudo
 # ssh/git from the host needs no password. Override: make HOST_PUBKEY=path
 HOST_PUBKEY ?= $(firstword $(wildcard $(HOME)/.ssh/id_ed25519.pub $(HOME)/.ssh/id_ecdsa.pub $(HOME)/.ssh/id_rsa.pub))
 
+# On-demand serial sharing: qemu always exposes the guest's second serial
+# port (/dev/ttyS1) as a listening TCP socket on localhost:$(SERIAL_PORT).
+# Nothing is required at boot -- attach a physical adapter at any time with
+# `make serial-attach SERIAL_DEV=/dev/ttyUSB0` (Ctrl-C detaches). The
+# relay hex/text-dumps both directions to your terminal and $(SERIAL_LOG).
+# NOTE: guest baud/termios on ttyS1 do not reach the physical adapter; set
+# SERIAL_BAUD to match the hardware.
+SERIAL_PORT ?= 7777
+SERIAL_BAUD ?= 115200
+SERIAL_LOG  ?= $(CURDIR)/serial-tap.log
+
 # Guest-side git layout and host-side ssh plumbing
 GUEST_GIT  := /workspace/git
 GUEST_SRC  := /workspace/src
 SSH_OPTS   := -p $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 GUEST_SSH  := ssh $(SSH_OPTS) $(DEVUSER)@localhost
+GUEST_SCP  := scp -r -P $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
 KERNEL     := $(CURDIR)/vmlinuz
 INITRD     := $(CURDIR)/initrd.img
@@ -194,6 +215,13 @@ repositories live on the writable workspace disk.
 - Never push to external remotes (GitHub, GitLab, ...). This sandbox has no
   upstream credentials by design; publishing is the user's job on the host.
 
+## Files from the user
+
+The host can drop files into `/workspace/files` (via `make put` on the
+host). When the user says they have shared or uploaded a file, look there.
+To hand a file back, place it somewhere under `/workspace` and tell the
+user its path; they retrieve it with `make get` on the host.
+
 ## Environment constraints
 
 - The root filesystem is read-only: `apt install`, editing files outside
@@ -238,7 +266,7 @@ export SERIAL_PROFILE
 # ---- stamps -----------------------------------------------------------------
 PROVISION_STAMP := $(LAYERS)/.provision-done
 
-.PHONY: help all check-deps base rootfs provision clean-provision reprovision install install-pkgs image workspace qemu ssh import repos clone clean clean-workspace distclean
+.PHONY: help all check-deps base rootfs provision clean-provision reprovision install install-pkgs put get pull convert-workspace serial-attach serial-log image workspace qemu ssh import repos clone clean clean-workspace distclean
 
 # muscle-memory alias for the renamed stage
 rootfs: base
@@ -250,14 +278,18 @@ Claustrum -- immutable Debian VM for Claude Code
   make qemu             boot the VM        make ssh   shell into it
   make import REPO=url  put a repo in the guest git server
   make repos            list guest repos   make clone NAME=n  clone to host
+  make put SRC=file     copy into guest    make pull FILE=path  copy back
+                                           (FILE is relative to /workspace)
   make reprovision      redo provisioning on the cached Debian base
   make install PKGS="a b"  add packages to the system image
   make check-deps       verify host tools
+  make serial-attach SERIAL_DEV=/dev/ttyUSB0   hot-plug a serial device
+                        into guest ttyS1 (Ctrl-C unplugs; traffic shown live)
 
   Rebuild cost:  edit provisioning -> reprovision (minutes)
                  new Debian base   -> distclean, then make (slow)
   Safe to delete:  claustrum.erofs, layers/, vmlinuz, initrd.img
-  Never auto-deleted:  workspace.img (your repos + claude login)
+  Never auto-deleted:  workspace.qcow2 (your repos + claude login)
 
   Details, variables, troubleshooting: see README.md
 endef
@@ -289,6 +321,7 @@ check-deps:
 	check mkfs.erofs       erofs-utils
 	check mkfs.ext4        e2fsprogs
 	check qemu-system-x86_64 qemu-system-x86
+	check qemu-img         qemu-utils
 	check ssh              openssh-client
 	check git              git
 	if [ -n "$$missing" ]; then
@@ -393,7 +426,7 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 		# so don't create it in the (soon to be immutable) rootfs
 		echo "root:$(ROOTPASS)" | chpasswd
 		id -u $(DEVUSER) >/dev/null 2>&1 || \
-			useradd -M -d /workspace/home/$(DEVUSER) -s /bin/bash -G sudo $(DEVUSER)
+			useradd -M -d /workspace/home/$(DEVUSER) -s /bin/bash -G sudo,dialout $(DEVUSER)
 		echo "$(DEVUSER):$(DEVPASS)" | chpasswd
 
 		# create dev's home (with skeleton) on the workspace disk at boot,
@@ -404,6 +437,7 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 		Z /workspace/home/$(DEVUSER) 0700 $(DEVUSER) $(DEVUSER) -
 		d /workspace/git 0755 $(DEVUSER) $(DEVUSER) -
 		d /workspace/src 0755 $(DEVUSER) $(DEVUSER) -
+		d /workspace/files 0755 $(DEVUSER) $(DEVUSER) -
 		TMPF
 
 		# ssh: also accept keys from the immutable /etc so the host's public
@@ -421,6 +455,22 @@ $(PROVISION_STAMP): $(BASE_IMG) | check-deps
 		DHCP=yes
 		NET
 		systemctl enable systemd-networkd systemd-resolved ssh
+
+		# grow the workspace filesystem to fill its disk on every boot
+		# (no-op when already full-size). Makes 'qemu-img resize' + reboot
+		# the complete story for enlarging the workspace.
+		cat > /etc/systemd/system/workspace-grow.service <<UNIT
+		[Unit]
+		Description=Grow /workspace filesystem to fill its disk
+		After=workspace.mount
+		Requires=workspace.mount
+		[Service]
+		Type=oneshot
+		ExecStart=/usr/sbin/resize2fs /dev/vdb
+		[Install]
+		WantedBy=multi-user.target
+		UNIT
+		systemctl enable workspace-grow.service
 
 		# mounts: immutable erofs root, writable workspace, tmpfs for scratch
 		mkdir -p /workspace
@@ -511,8 +561,14 @@ workspace: $(WS_IMG)
 
 $(WS_IMG): | check-deps
 	set -euo pipefail
-	truncate -s $(WS_SIZE) $(WS_IMG)
-	mkfs.ext4 -q -F -L workspace $(WS_IMG)
+	# mkfs can't write into qcow2 directly: format a sparse raw temp file,
+	# then convert -- the resulting qcow2 only stores allocated clusters
+	tmp=$(WS_IMG).raw.tmp
+	rm -f "$$tmp"
+	truncate -s $(WS_SIZE) "$$tmp"
+	mkfs.ext4 -q -F -L workspace "$$tmp"
+	qemu-img convert -f raw -O qcow2 "$$tmp" $(WS_IMG)
+	rm -f "$$tmp"
 
 # ---- 5. boot it --------------------------------------------------------------
 qemu: $(IMG) $(WS_IMG) | check-deps
@@ -523,9 +579,11 @@ qemu: $(IMG) $(WS_IMG) | check-deps
 		-initrd $(INITRD) \
 		-append "root=/dev/vda ro rootfstype=erofs console=ttyS0 net.ifnames=0 quiet" \
 		-drive file=$(IMG),format=raw,if=virtio,read-only=on \
-		-drive file=$(WS_IMG),format=raw,if=virtio \
+		-drive file=$(WS_IMG),format=qcow2,if=virtio \
 		-netdev user,id=net0,hostfwd=tcp::$(SSH_PORT)-:22 \
 		-device virtio-net-pci,netdev=net0 \
+		-chardev socket,id=extser,host=127.0.0.1,port=$(SERIAL_PORT),server=on,wait=off \
+		-serial mon:stdio -serial chardev:extser \
 		-nographic
 
 ssh:
@@ -573,6 +631,87 @@ clean-provision:
 	umount_stack
 	$(SUDO) rm -rf $(UPPER) $(OVLWORK) $(MERGED) $(LOWER)
 	rm -f $(PROVISION_STAMP) $(IMG)
+
+# Copy files or directories from the host into the guest (VM must be
+# running). Default destination is the /workspace/files drop directory.
+#   make put SRC=./data.csv            -> guest:/workspace/files/data.csv
+#   make put SRC=./corpus DEST=/workspace/src/proj/corpus
+put: | check-deps
+	set -euo pipefail
+	if [ -z "$(SRC)" ]; then
+		echo 'usage: make put SRC=<host-path> [DEST=<guest-path>]'; exit 1
+	fi
+	dest="$(DEST)"; [ -n "$$dest" ] || dest=/workspace/files/
+	# ensure the destination directory exists in the guest: a trailing slash
+	# means dest IS the directory, otherwise its parent is
+	case "$$dest" in
+		*/) destdir="$$dest" ;;
+		*)  destdir="$$(dirname "$$dest")" ;;
+	esac
+	$(GUEST_SSH) "mkdir -p '$$destdir'"
+	$(GUEST_SCP) $(SRC) $(DEVUSER)@localhost:"$$dest"
+	echo "-> guest:$$dest"
+
+# Copy files or directories from the guest back to the host.
+#   make get SRC=/workspace/files/report.pdf [DEST=.]
+get: | check-deps
+	set -euo pipefail
+	if [ -z "$(SRC)" ]; then
+		echo 'usage: make get SRC=<guest-path> [DEST=<host-path>]'; exit 1
+	fi
+	dest="$(DEST)"; [ -n "$$dest" ] || dest=.
+	$(GUEST_SCP) $(DEVUSER)@localhost:"$(SRC)" "$$dest"
+
+# Pull a file or directory from the guest workspace, by workspace-relative
+# path (sugar over `make get`).
+#   make pull FILE=files/report.pdf [DEST=.]
+pull: | check-deps
+	set -euo pipefail
+	if [ -z "$(FILE)" ]; then
+		echo 'usage: make pull FILE=<path-under-/workspace> [DEST=<host-path>]'; exit 1
+	fi
+	$(MAKE) get SRC="/workspace/$(FILE)" DEST="$(DEST)"
+
+# One-time migration of a pre-existing raw workspace.img to qcow2 (and up
+# to $(WS_SIZE)). Data is preserved; the old raw file is kept until you
+# delete it yourself. The VM must be shut down first.
+convert-workspace: | check-deps
+	set -euo pipefail
+	if [ ! -f $(WS_OLD_RAW) ]; then
+		echo "no $(WS_OLD_RAW) to convert"; exit 1
+	fi
+	if [ -f $(WS_IMG) ]; then
+		echo "$(WS_IMG) already exists; refusing to overwrite"; exit 1
+	fi
+	qemu-img convert -p -f raw -O qcow2 $(WS_OLD_RAW) $(WS_IMG)
+	qemu-img resize $(WS_IMG) $(WS_SIZE)
+	echo ""
+	echo "Converted. The filesystem inside grows to $(WS_SIZE) automatically"
+	echo "on the next boot (workspace-grow service). Old raw image kept at"
+	echo "$(WS_OLD_RAW); delete it once you've verified the new one."
+
+# Attach a local serial device to the running VM's ttyS1, on demand.
+# Runs in the foreground showing traffic (and appending to $(SERIAL_LOG));
+# Ctrl-C detaches. Re-run any time to re-attach.
+#   make serial-attach SERIAL_DEV=/dev/ttyUSB0 [SERIAL_BAUD=115200]
+serial-attach:
+	set -euo pipefail
+	if [ -z "$(SERIAL_DEV)" ]; then
+		echo 'usage: make serial-attach SERIAL_DEV=/dev/ttyUSB0 [SERIAL_BAUD=...]'; exit 1
+	fi
+	command -v socat >/dev/null 2>&1 || {
+		echo "needs socat on the host: sudo apt install socat"; exit 1; }
+	[ -r "$(SERIAL_DEV)" ] && [ -w "$(SERIAL_DEV)" ] || {
+		echo "cannot open $(SERIAL_DEV) -- add yourself to the host dialout group?"; exit 1; }
+	echo "attaching $(SERIAL_DEV) @$(SERIAL_BAUD) -> guest /dev/ttyS1 (Ctrl-C detaches)"
+	socat -x -v \
+		$(SERIAL_DEV),raw,echo=0,b$(SERIAL_BAUD) \
+		TCP:127.0.0.1:$(SERIAL_PORT) \
+		2>&1 | tee -a $(SERIAL_LOG)
+
+# Follow the serial traffic log without being the attach terminal
+serial-log:
+	tail -f $(SERIAL_LOG)
 
 # Redo provisioning from the pristine cached base: no debootstrap,
 # no Debian re-download -- typically the apt mirror fetch is all that's left
